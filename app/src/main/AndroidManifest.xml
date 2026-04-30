@@ -20,7 +20,7 @@
 
         <meta-data
                 android:name="xposedscope"
-                android:value="com.xiaomi.aicr" />
+                android:resource="@array/example_scope" />
 
         <meta-data
                 android:name="xposedminversion"

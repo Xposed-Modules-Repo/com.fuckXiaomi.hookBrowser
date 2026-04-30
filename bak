@@ -1,0 +1,238 @@
+package com.fuckXiaomi.hookBrowser;
+
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.Icon;
+import android.net.Uri;
+import android.os.Bundle;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodReplacement;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
+import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+public class MainHook implements IXposedHookLoadPackage {
+
+    // 极简配置文件路径
+    private static final String CONFIG_PATH = "/data/local/tmp/browser.txt";
+
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
+        String pkgName = lpparam.packageName;
+
+        // ==========================================
+        // 十字路口：按包名分发任务
+        // ==========================================
+        if ("com.xiaomi.aicr".equals(pkgName)) {
+            XposedBridge.log("成功注入 小米澎湃AI引擎 进程！");
+            hookAicr(lpparam);
+        } else if ("com.miui.voiceassist".equals(pkgName)) {
+            XposedBridge.log("成功注入 超级小爱 进程！");
+            hookVoiceAssist(lpparam);
+        }
+    }
+
+    // ========================================================
+    // 战区 1：[小米澎湃AI引擎] 专属 Hook 逻辑
+    // ========================================================
+    private void hookAicr(XC_LoadPackage.LoadPackageParam lpparam) {
+        String targetClass = "com.xiaomi.aicr.copydirect.util.SmartPasswordUtils";
+
+        // 1. 核心拦截：替换 Intent 的目标包名
+        XposedHelpers.findAndHookMethod(targetClass, lpparam.classLoader, "jumpToXiaoMiBrowser",
+                Context.class, String.class, new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                        Context context = (Context) param.args[0];
+                        String str = (String) param.args[1];
+
+                        Intent intent = new Intent("android.intent.action.VIEW");
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        intent.putExtra("open_source", "clipboard_open");
+
+                        if (str.startsWith("http")) {
+                            intent.setData(Uri.parse(str));
+                        } else {
+                            intent.setData(Uri.parse("https://" + str));
+                        }
+
+                        String userBrowserPkg = getCustomBrowserPkg();
+                        if (userBrowserPkg != null && !userBrowserPkg.isEmpty()) {
+                            intent.setPackage(userBrowserPkg);
+                            XposedBridge.log("AI引擎：已强行注入目标浏览器: " + userBrowserPkg);
+                        } else {
+                            XposedBridge.log("AI引擎：未检测到配置文件，准备唤起系统选择器");
+                        }
+
+                        context.startActivity(intent);
+                        return null;
+                    }
+                });
+
+        // 2. 彻底斩断 Binder 死循环：拦截最底层的安装检查
+        XposedHelpers.findAndHookMethod(targetClass, lpparam.classLoader, "isInstallForApp",
+                Context.class, String.class, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        String pkgName = (String) param.args[1];
+                        if ("com.android.browser".equals(pkgName)) {
+                            param.setResult(true);
+                        }
+                    }
+                });
+
+        // 3. 在通知发送前的最后一刻，替换掉包裹里的图标
+        XposedHelpers.findAndHookMethod("android.app.NotificationManager", lpparam.classLoader, "notify",
+                int.class, android.app.Notification.class, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                        int id = (int) param.args[0];
+                        android.app.Notification notification = (android.app.Notification) param.args[1];
+
+                        if (id == 111 && notification != null && notification.extras != null) {
+                            Bundle extras = notification.extras;
+                            if (extras.getString("copyText") != null) {
+                                String customPkg = getCustomBrowserPkg();
+                                if (customPkg == null || customPkg.isEmpty()) return;
+
+                                try {
+                                    Context context = android.app.AndroidAppHelper.currentApplication();
+                                    Icon newIcon = getCustomAppIcon(context, customPkg);
+
+                                    XposedHelpers.setObjectField(notification, "mSmallIcon", newIcon);
+                                    XposedHelpers.setObjectField(notification, "mLargeIcon", newIcon);
+
+                                    extras.putParcelable("miui.appIcon", newIcon);
+                                    Bundle miuiFocusPics = extras.getBundle("miui.focus.pics");
+                                    if (miuiFocusPics != null) {
+                                        miuiFocusPics.putParcelable("miui.focus.pic_image", newIcon);
+                                        miuiFocusPics.putParcelable("miui.land.pic_image", newIcon);
+                                    }
+                                    XposedBridge.log("AI引擎：成功替换通知栏悬浮窗图标为: " + customPkg);
+                                } catch (Exception e) {
+                                    XposedBridge.log("替换图标失败: " + e.getMessage());
+                                }
+                            }
+                        }
+                    }
+                });
+    }
+
+    // ========================================================
+    // 战区 2：[超级小爱] 专属 Hook 逻辑 (全局堵门法)
+    // ========================================================
+    private void hookVoiceAssist(XC_LoadPackage.LoadPackageParam lpparam) {
+        // 目标锁定：你用 Jadx 挖出的那个组装 Intent 的核心工具类
+        String targetClass = "com.xiaomi.voiceassistant.utils.b2";
+
+        XposedHelpers.findAndHookMethod(
+                targetClass,
+                lpparam.classLoader,
+                "openInBrowser",
+                String.class, // 方法参数是一个 String (url)
+                new XC_MethodReplacement() { // 注意：这里改成了 XC_MethodReplacement！彻底替换！
+                    @Override
+                    protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                        String url = (String) param.args[0];
+
+                        // 我们自己从头构建一个干净的 Intent
+                        Intent intent = new Intent();
+                        intent.setAction("android.intent.action.VIEW");
+                        if (url != null) {
+                            intent.setData(Uri.parse(url));
+                        }
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); // 相当于 Intent.FLAG_ACTIVITY_NEW_TASK
+
+                        // 注入配置包名
+                        String customPkg = getCustomBrowserPkg();
+                        if (customPkg != null && !customPkg.isEmpty()) {
+                            intent.setPackage(customPkg);
+                            XposedBridge.log("超级小爱：成功拦截并重写跳转 Intent -> " + customPkg);
+                        } else {
+                            XposedBridge.log("超级小爱：未配置浏览器，准备唤起系统选择器");
+                        }
+
+                        // 直接返回我们自己魔改的 Intent，原方法逻辑彻底被架空！
+                        return intent;
+                    }
+                }
+        );
+
+        // 【双保险】为了防止小爱在跳转失败后依然去调起应用商店，我们要把那个兜底方法也废掉！
+        XposedHelpers.findAndHookMethod(
+                targetClass,
+                lpparam.classLoader,
+                "handleBackForStartIntent",
+                Intent.class, String.class, boolean.class, // 三个参数的方法
+                new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                        XposedBridge.log("超级小爱：成功拦截并废弃应用商店跳转备用逻辑");
+                        // 什么都不做，直接返回 null，让它的跳转彻底死在这里
+                        return null;
+                    }
+                }
+        );
+
+        XposedHelpers.findAndHookMethod(
+                targetClass,
+                lpparam.classLoader,
+                "handleBackForStartIntent",
+                Intent.class, Context.class, // 两个参数的重载方法
+                new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                        XposedBridge.log("超级小爱：成功拦截并废弃应用商店跳转备用逻辑(重载)");
+                        return null;
+                    }
+                }
+        );
+    }
+
+    // ========================================================
+    // 工具方法区 (后勤保障)
+    // ========================================================
+    private String getCustomBrowserPkg() {
+        File configFile = new File(CONFIG_PATH);
+        if (configFile.exists() && configFile.canRead()) {
+            try (BufferedReader br = new BufferedReader(new FileReader(configFile))) {
+                String line = br.readLine();
+                if (line != null && !line.trim().isEmpty()) {
+                    return line.trim();
+                }
+            } catch (Exception e) {
+                XposedBridge.log("读取配置文件失败: " + e.getMessage());
+            }
+        }
+        return "";
+    }
+
+    private Icon getCustomAppIcon(Context context, String pkgName) throws PackageManager.NameNotFoundException {
+        PackageManager pm = context.getPackageManager();
+        Drawable customAppIcon = pm.getApplicationIcon(pkgName);
+
+        Bitmap bitmap;
+        if (customAppIcon instanceof BitmapDrawable) {
+            bitmap = ((BitmapDrawable) customAppIcon).getBitmap();
+        } else {
+            int width = Math.max(customAppIcon.getIntrinsicWidth(), 1);
+            int height = Math.max(customAppIcon.getIntrinsicHeight(), 1);
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            customAppIcon.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+            customAppIcon.draw(canvas);
+        }
+        return Icon.createWithBitmap(bitmap);
+    }
+}

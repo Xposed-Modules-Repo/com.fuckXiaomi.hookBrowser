@@ -24,28 +24,29 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
     
-    // 极简配置文件路径
     private static final String CONFIG_PATH = "/data/local/tmp/browser.txt";
     
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!lpparam.packageName.equals("com.xiaomi.aicr")) {
-            return;
-        }
+        String pkgName = lpparam.packageName;
         
-        XposedBridge.log("成功注入小米AI识别进程！(纯净极简版)");
+        if ("com.xiaomi.aicr".equals(pkgName)) {
+            XposedBridge.log("成功注入 小米澎湃AI引擎 进程！");
+            hookAicr(lpparam);
+        } else if ("com.miui.voiceassist".equals(pkgName)) {
+            XposedBridge.log("成功注入 超级小爱 进程！");
+            hookVoiceAssist(lpparam);
+        }
+    }
+    
+    // ========================================================
+    // 1：[小米澎湃AI引擎]
+    // ========================================================
+    private void hookAicr(XC_LoadPackage.LoadPackageParam lpparam) {
         String targetClass = "com.xiaomi.aicr.copydirect.util.SmartPasswordUtils";
         
-        // ========================================================
-        // 1. 核心拦截：替换 Intent 的目标包名
-        // ========================================================
-        XposedHelpers.findAndHookMethod(
-                targetClass,
-                lpparam.classLoader,
-                "jumpToXiaoMiBrowser",
-                Context.class,
-                String.class,
-                new XC_MethodReplacement() {
+        XposedHelpers.findAndHookMethod(targetClass, lpparam.classLoader, "jumpToXiaoMiBrowser",
+                Context.class, String.class, new XC_MethodReplacement() {
                     @Override
                     protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
                         Context context = (Context) param.args[0];
@@ -55,104 +56,208 @@ public class MainHook implements IXposedHookLoadPackage {
                         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         intent.putExtra("open_source", "clipboard_open");
                         
-                        if (str.startsWith("http")) {
-                            intent.setData(Uri.parse(str));
-                        } else {
-                            intent.setData(Uri.parse("https://" + str));
-                        }
+                        if (str.startsWith("http")) intent.setData(Uri.parse(str));
+                        else intent.setData(Uri.parse("https://" + str));
                         
-                        // 动态读取你的配置文件
                         String userBrowserPkg = getCustomBrowserPkg();
                         if (userBrowserPkg != null && !userBrowserPkg.isEmpty()) {
                             intent.setPackage(userBrowserPkg);
-                            XposedBridge.log("已强行注入目标浏览器: " + userBrowserPkg);
                         } else {
-                            XposedBridge.log("未检测到配置文件，准备唤起系统选择器");
+                            intent.setPackage(null);
                         }
-                        
                         context.startActivity(intent);
                         return null;
                     }
-                }
-        );
+                });
         
-        // ========================================================
-        // 2. 彻底斩断 Binder 死循环：拦截最底层的安装检查
-        // ========================================================
-        XposedHelpers.findAndHookMethod(
-                targetClass,
-                lpparam.classLoader,
-                "isInstallForApp",
-                Context.class,
-                String.class,
-                new XC_MethodHook() {
+        XposedHelpers.findAndHookMethod(targetClass, lpparam.classLoader, "isInstallForApp",
+                Context.class, String.class, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                        String pkgName = (String) param.args[1];
-                        if ("com.android.browser".equals(pkgName)) {
-                            param.setResult(true);
-                        }
+                        if ("com.android.browser".equals(param.args[1])) param.setResult(true);
                     }
-                }
-        );
+                });
         
-        // ========================================================
-        // 3. 在通知发送前的最后一刻，替换掉包裹里的图标！
-        // ========================================================
-        XposedHelpers.findAndHookMethod(
-                "android.app.NotificationManager",
-                lpparam.classLoader,
-                "notify",
-                int.class,
-                android.app.Notification.class,
-                new XC_MethodHook() {
+        XposedHelpers.findAndHookMethod("android.app.NotificationManager", lpparam.classLoader, "notify",
+                int.class, android.app.Notification.class, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                         int id = (int) param.args[0];
                         android.app.Notification notification = (android.app.Notification) param.args[1];
-                        
                         if (id == 111 && notification != null && notification.extras != null) {
-                            Bundle extras = notification.extras;
-                            
-                            // 确认是复制网址的通知
-                            if (extras.getString("copyText") != null) {
+                            if (notification.extras.getString("copyText") != null) {
                                 String customPkg = getCustomBrowserPkg();
                                 if (customPkg == null || customPkg.isEmpty()) return;
-                                
                                 try {
                                     Context context = android.app.AndroidAppHelper.currentApplication();
                                     Icon newIcon = getCustomAppIcon(context, customPkg);
-                                    
-                                    // 暴力替换通知里的所有关键图标！
                                     XposedHelpers.setObjectField(notification, "mSmallIcon", newIcon);
                                     XposedHelpers.setObjectField(notification, "mLargeIcon", newIcon);
-                                    
-                                    // 替换小米特有的 Bundle 里的图标
-                                    extras.putParcelable("miui.appIcon", newIcon);
-                                    Bundle miuiFocusPics = extras.getBundle("miui.focus.pics");
-                                    if (miuiFocusPics != null) {
-                                        miuiFocusPics.putParcelable("miui.focus.pic_image", newIcon);
-                                        miuiFocusPics.putParcelable("miui.land.pic_image", newIcon);
+                                    notification.extras.putParcelable("miui.appIcon", newIcon);
+                                    Bundle focusPics = notification.extras.getBundle("miui.focus.pics");
+                                    if (focusPics != null) {
+                                        focusPics.putParcelable("miui.focus.pic_image", newIcon);
+                                        focusPics.putParcelable("miui.land.pic_image", newIcon);
                                     }
-                                    
-                                    XposedBridge.log("成功替换通知栏悬浮窗图标为: " + customPkg);
-                                } catch (Exception e) {
-                                    XposedBridge.log("替换图标失败: " + e.getMessage());
-                                }
+                                } catch (Exception ignored) {}
                             }
                         }
                     }
+                });
+    }
+    
+    // ========================================================
+    // 2：[超级小爱]
+    // ========================================================
+    private void hookVoiceAssist(XC_LoadPackage.LoadPackageParam lpparam) {
+        String targetClass = "com.xiaomi.voiceassistant.utils.b2";
+        
+        try {
+            Class<?> b2Class = XposedHelpers.findClass(targetClass, lpparam.classLoader);
+            
+            for (java.lang.reflect.Method method : b2Class.getDeclaredMethods()) {
+                
+                // 1. 查岗拦截 (欺骗系统验证)
+                if ("isIntentAvailable".equals(method.getName()) && method.getReturnType() == boolean.class) {
+                    XposedBridge.hookMethod(method, new XC_MethodReplacement() {
+                        @Override
+                        protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                            for (Object arg : param.args) {
+                                if (arg instanceof Intent) {
+                                    Intent intent = (Intent) arg;
+                                    if ("com.android.browser".equals(intent.getPackage()) ||
+                                            (intent.getComponent() != null && intent.getComponent().getPackageName().contains("browser"))) {
+                                        
+                                        String customPkg = getCustomBrowserPkg();
+                                        if (customPkg != null && !customPkg.isEmpty()) {
+                                            intent.setPackage(customPkg);
+                                        } else {
+                                            intent.setPackage(null);
+                                        }
+                                        intent.setComponent(null); // 彻底抹除小米的固定组件名
+                                    }
+                                }
+                            }
+                            return true;
+                        }
+                    });
                 }
-        );
+                
+                // 2. 启动拦截与 URL 纯净提取
+                if ("startActivity".equals(method.getName()) && method.getReturnType() == boolean.class) {
+                    XposedBridge.hookMethod(method, new XC_MethodReplacement() {
+                        @Override
+                        protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                            Context ctx = null;
+                            Intent intent = null;
+                            
+                            for (Object arg : param.args) {
+                                if (arg instanceof Context) ctx = (Context) arg;
+                                if (arg instanceof Intent) intent = (Intent) arg;
+                            }
+                            
+                            if (ctx != null && intent != null) {
+                                String customPkg = getCustomBrowserPkg();
+                                
+                                // A. 斩断包名限制
+                                if (customPkg != null && !customPkg.isEmpty()) {
+                                    if ("com.android.browser".equals(intent.getPackage()) || customPkg.equals(intent.getPackage())) {
+                                        intent.setPackage(customPkg);
+                                        intent.setComponent(null);
+                                    }
+                                } else {
+                                    if ("com.android.browser".equals(intent.getPackage())) {
+                                        intent.setPackage(null);
+                                        intent.setComponent(null);
+                                    }
+                                }
+                                
+                                // B. 精确提取目标网址
+                                Uri data = intent.getData();
+                                if (data != null) {
+                                    String scheme = data.getScheme();
+                                    if (scheme != null && (scheme.startsWith("mi") || scheme.equals("intent"))) {
+                                        String realUrl = null;
+                                        
+                                        // 优先级1：核心参数提取
+                                        String[] targetKeys = {"url", "query", "q", "link", "text"};
+                                        for (String targetKey : targetKeys) {
+                                            try {
+                                                String val = data.getQueryParameter(targetKey);
+                                                if (val != null && !val.trim().isEmpty()) {
+                                                    realUrl = val.trim();
+                                                    break;
+                                                }
+                                            } catch (Exception ignored) {}
+                                        }
+                                        
+                                        // 优先级2：模糊嗅探疑似网址的参数
+                                        if (realUrl == null) {
+                                            try {
+                                                for (String key : data.getQueryParameterNames()) {
+                                                    String val = data.getQueryParameter(key);
+                                                    if (val != null) {
+                                                        val = val.trim();
+                                                        if (val.startsWith("http") || (val.contains(".") && !val.contains(" "))) {
+                                                            realUrl = val;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {}
+                                        }
+                                        
+                                        // 优先级3：翻找 Extras 包裹
+                                        if (realUrl == null && intent.getExtras() != null) {
+                                            Bundle extras = intent.getExtras();
+                                            for (String key : extras.keySet()) {
+                                                Object val = extras.get(key);
+                                                if (val instanceof String) {
+                                                    String s = ((String) val).trim();
+                                                    if (s.startsWith("http") || (s.contains(".") && !s.contains(" ") && s.length() > 4)) {
+                                                        realUrl = s;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // C. 网址标准化并重挂载
+                                        if (realUrl != null && !realUrl.isEmpty()) {
+                                            realUrl = java.net.URLDecoder.decode(realUrl, "UTF-8");
+                                            if (!realUrl.startsWith("http://") && !realUrl.startsWith("https://")) {
+                                                realUrl = "https://" + realUrl;
+                                            }
+                                            intent.setData(Uri.parse(realUrl));
+                                            XposedBridge.log("超级小爱：成功净化并启动网址 -> " + realUrl);
+                                        }
+                                    }
+                                }
+                                
+                                // D. 原生接管发射
+                                try {
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                    ctx.startActivity(intent);
+                                    return true;
+                                } catch (Exception e) {
+                                    XposedBridge.log("超级小爱：原生启动异常 -> " + e.getMessage());
+                                    return false;
+                                }
+                            }
+                            return false;
+                        }
+                    });
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("Hook b2 失败: " + t.getMessage());
+        }
     }
     
     // ========================================================
     // 工具方法区
     // ========================================================
-    
-    /**
-     * 读取单行纯文本配置文件
-     */
+    // 读取单行纯文本配置文件
     private String getCustomBrowserPkg() {
         File configFile = new File(CONFIG_PATH);
         if (configFile.exists() && configFile.canRead()) {
@@ -161,25 +266,19 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (line != null && !line.trim().isEmpty()) {
                     return line.trim();
                 }
-            } catch (Exception e) {
-                XposedBridge.log("读取配置文件失败: " + e.getMessage());
-            }
+            } catch (Exception ignored) {}
         }
         return "";
     }
     
-    /**
-     * 获取第三方应用的 Icon 对象 (封装了 Drawable 转 Bitmap 的逻辑)
-     */
+    // 获取第三方应用的 Icon 对象
     private Icon getCustomAppIcon(Context context, String pkgName) throws PackageManager.NameNotFoundException {
         PackageManager pm = context.getPackageManager();
         Drawable customAppIcon = pm.getApplicationIcon(pkgName);
-        
         Bitmap bitmap;
         if (customAppIcon instanceof BitmapDrawable) {
             bitmap = ((BitmapDrawable) customAppIcon).getBitmap();
         } else {
-            // 兼容矢量图或自适应图标的绘制
             int width = Math.max(customAppIcon.getIntrinsicWidth(), 1);
             int height = Math.max(customAppIcon.getIntrinsicHeight(), 1);
             bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
